@@ -21,6 +21,8 @@ mcp = MCPServer(
 )
 
 PERIODES = ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"]
+# Nombre de points par an pour annualiser la volatilité.
+INTERVALLES = {"jour": 252, "semaine": 52}
 
 
 class ErreurDonnees(Exception):
@@ -33,10 +35,12 @@ def _r(x: float) -> float | None:
     return None if math.isnan(x) else round(x, 4)
 
 
-def _clotures(ticker: str, periode: str) -> pd.Series:
-    """Série des cours de clôture ajustés, ou ErreurDonnees si vide/inconnu."""
+def _clotures(ticker: str, periode: str, intervalle: str = "jour") -> pd.Series:
+    """Série des cours de clôture ajustés (journaliers ou du vendredi), ou ErreurDonnees si vide/inconnu."""
     if periode not in PERIODES:
         raise ErreurDonnees(f"Période '{periode}' invalide. Valeurs possibles : {', '.join(PERIODES)}.")
+    if intervalle not in INTERVALLES:
+        raise ErreurDonnees(f"Intervalle '{intervalle}' invalide. Valeurs possibles : {', '.join(INTERVALLES)}.")
     try:
         hist = yf.Ticker(ticker).history(period=periode, auto_adjust=True)
     except Exception as e:
@@ -47,6 +51,9 @@ def _clotures(ticker: str, periode: str) -> pd.Series:
     if clotures.empty:
         raise ErreurDonnees(f"Aucun cours de clôture pour '{ticker}' sur '{periode}'.")
     clotures.index = clotures.index.tz_localize(None).normalize()
+    if intervalle == "semaine":
+        # Dernière clôture de chaque semaine, datée du vendredi : mêmes dates pour toutes les places.
+        clotures = clotures.resample("W-FRI").last().dropna()
     return clotures
 
 
@@ -57,14 +64,14 @@ def _devise(ticker: str) -> str:
         return "inconnue"
 
 
-def _metriques(clotures: pd.Series) -> dict:
+def _metriques(clotures: pd.Series, intervalle: str) -> dict:
     rdt = clotures.pct_change().dropna()
     drawdown = clotures / clotures.cummax() - 1
     return {
         "rendement_total": _r(clotures.iloc[-1] / clotures.iloc[0] - 1),
-        "volatilite_annualisee": _r(rdt.std() * math.sqrt(252)) if len(rdt) > 1 else None,
+        "volatilite_annualisee": _r(rdt.std() * math.sqrt(INTERVALLES[intervalle])) if len(rdt) > 1 else None,
         "drawdown_max": _r(drawdown.min()),
-        "nb_jours": len(clotures),
+        "nb_points": len(clotures),
     }
 
 
@@ -99,36 +106,47 @@ def prix(ticker: str, periode: str = "1y") -> dict:
 
 
 @mcp.tool()
-def rendements(ticker: str, periode: str = "1y") -> dict:
+def rendements(ticker: str, periode: str = "1y", intervalle: str = "jour") -> dict:
     """Calcule la performance et le risque d'un actif sur une période :
-    rendement total, volatilité annualisée (écart-type des rendements journaliers × √252)
-    et drawdown maximum (pire baisse depuis un sommet). Valeurs en décimales (0.12 = 12 %).
+    rendement total, volatilité annualisée (écart-type des rendements × √252 en journalier,
+    × √52 en hebdomadaire) et drawdown maximum (pire baisse depuis un sommet).
+    Valeurs en décimales (0.12 = 12 %), plus la devise et le nombre de cours utilisés.
     À utiliser pour "combien a rapporté X ?", "X est-il risqué ?", "quelle a été la pire chute de X ?".
 
     Args:
         ticker: symbole Yahoo Finance (ex. AAPL, MSFT, IWDA.AS, MC.PA, ^GSPC).
         periode: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd ou max (défaut 1y).
+        intervalle: "jour" (clôtures journalières, défaut) ou "semaine" (clôtures du vendredi).
 
     Renvoie {"erreur": ...} si le ticker est inconnu.
     """
     try:
-        c = _clotures(ticker, periode)
+        c = _clotures(ticker, periode, intervalle)
     except ErreurDonnees as e:
         return {"erreur": str(e)}
-    return {"ticker": ticker, "periode": periode, **_metriques(c)}
+    return {
+        "ticker": ticker,
+        "periode": periode,
+        "intervalle": intervalle,
+        "devise": _devise(ticker),
+        **_metriques(c, intervalle),
+    }
 
 
 @mcp.tool()
-def comparer(tickers: list[str], periode: str = "1y") -> dict:
-    """Compare plusieurs actifs sur une même période : pour chacun, rendement total,
+def comparer(tickers: list[str], periode: str = "1y", intervalle: str = "jour") -> dict:
+    """Compare plusieurs actifs sur une même période : pour chacun, devise, rendement total,
     volatilité annualisée et drawdown maximum, plus la matrice de corrélation
-    des rendements journaliers (calculée sur les dates communes).
+    des rendements (calculée paire par paire sur les dates communes).
     À utiliser pour "AAPL ou MSFT ?", "mon portefeuille est-il diversifié ?",
     "ces actifs bougent-ils ensemble ?".
 
     Args:
         tickers: liste de symboles Yahoo Finance (ex. ["AAPL", "MSFT", "IWDA.AS"]).
         periode: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd ou max (défaut 1y).
+        intervalle: "jour" (défaut) ou "semaine". Préférer "semaine" pour comparer des places
+            aux horaires décalés (ex. Amsterdam vs New York) : en journalier, le décalage
+            de clôture sous-estime la corrélation.
 
     Un ticker invalide apparaît avec une erreur sans bloquer les autres.
     """
@@ -139,14 +157,14 @@ def comparer(tickers: list[str], periode: str = "1y") -> dict:
     metriques, series = {}, {}
     for t in tickers:
         try:
-            c = _clotures(t, periode)
+            c = _clotures(t, periode, intervalle)
         except ErreurDonnees as e:
             metriques[t] = {"erreur": str(e)}
             continue
-        metriques[t] = _metriques(c)
+        metriques[t] = {"devise": _devise(t), **_metriques(c, intervalle)}
         series[t] = c
 
-    resultat = {"periode": periode, "metriques": metriques}
+    resultat = {"periode": periode, "intervalle": intervalle, "metriques": metriques}
     if len(series) < 2:
         resultat["correlation"] = None
         resultat["note"] = "Il faut au moins 2 tickers valides pour une corrélation."
@@ -159,7 +177,7 @@ def comparer(tickers: list[str], periode: str = "1y") -> dict:
     present = rdt.notna().astype(int)
     communs = present.T @ present
     resultat["correlation"] = {a: {b: _r(corr.loc[a, b]) for b in corr.columns} for a in corr.index}
-    resultat["nb_jours_communs"] = {
+    resultat["nb_points_communs"] = {
         f"{a}/{b}": int(communs.loc[a, b]) for i, a in enumerate(communs.index) for b in communs.columns[i + 1 :]
     }
     return resultat

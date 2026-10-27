@@ -16,7 +16,10 @@ for t in TICKERS:
     afficher(f"prix({t})", prix(t))
     afficher(f"rendements({t})", rendements(t))
 
+afficher("rendements(AAPL, intervalle='semaine')", rendements("AAPL", intervalle="semaine"))
 afficher("comparer(AAPL, MSFT, IWDA.AS)", comparer(TICKERS))
+afficher("comparer(AAPL, MSFT, IWDA.AS, intervalle='semaine')", comparer(TICKERS, intervalle="semaine"))
+afficher("rendements(AAPL, intervalle='mois')", rendements("AAPL", intervalle="mois"))
 
 # Robustesse : ticker bidon et période invalide
 afficher("prix(XXXXINVALIDE)", prix("XXXXINVALIDE"))
