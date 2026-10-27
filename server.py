@@ -152,11 +152,16 @@ def comparer(tickers: list[str], periode: str = "1y") -> dict:
         resultat["note"] = "Il faut au moins 2 tickers valides pour une corrélation."
         return resultat
 
-    # Les places ont des jours fériés différents : on garde les dates communes.
-    rdt = pd.DataFrame(series).dropna().pct_change().dropna()
+    # Rendements calculés par série AVANT d'aligner (sinon un jour férié sur une place
+    # crée des rendements sur 2 jours), puis corrélation paire par paire sur les dates communes.
+    rdt = pd.DataFrame({t: c.pct_change() for t, c in series.items()}).iloc[1:]
     corr = rdt.corr()
+    present = rdt.notna().astype(int)
+    communs = present.T @ present
     resultat["correlation"] = {a: {b: _r(corr.loc[a, b]) for b in corr.columns} for a in corr.index}
-    resultat["nb_jours_communs"] = len(rdt)
+    resultat["nb_jours_communs"] = {
+        f"{a}/{b}": int(communs.loc[a, b]) for i, a in enumerate(communs.index) for b in communs.columns[i + 1 :]
+    }
     return resultat
 
 
